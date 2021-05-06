@@ -1,0 +1,920 @@
+// ranger
+// Copyright (c) 2021, Framework Labs.
+
+// Types
+
+/// A collection of user configurable settings which get persisted.
+struct Settings
+    var measureFromBack: bool
+    var brightness: nat8
+    var bleEnabled: bool
+    var measureUnit: nat8
+end
+
+/// Current information about the battery state.
+struct BatteryInfo
+    var voltage: float32
+    var stateOfCharge: nat8 // 0..100
+    var isCharging: bool
+end
+
+/// Information about the current state of the buttons.
+struct ButtonStates
+    var aPressed: bool
+    var aReleased: bool
+    var bPressed: bool
+    var bReleased: bool
+end
+
+/// A structure indicating that a request should be displayed.
+struct DialogRequest
+    /// The type of the request. Lower numbers have higher priority.
+    var kind: nat8
+    /// Additional information about the request to be displayed.
+    var info: nat8
+end  
+
+// Constants
+
+const ERR_OK: nat8 = 0
+
+@[CConst (binding = "UNDEF_RANGE", header = "env.h")]
+extern const UNDEF_RANGE: nat16
+
+const PRESS_NONE = 0: nat8
+const PRESS_SHORT = 1: nat8
+const PRESS_LONG = 2: nat8
+const PRESS_DOUBLE = 3: nat8
+
+const NO_DIALOG: nat8 = 0
+@[CConst (binding = "DIALOG_BATTERY", header = "env.h")]
+extern const DIALOG_BATTERY: nat8
+@[CConst (binding = "DIALOG_BLE", header = "env.h")]
+extern const DIALOG_BLE: nat8
+@[CConst (binding = "DIALOG_USB", header = "env.h")]
+extern const DIALOG_USB: nat8
+const NUM_DIALOGS: nat8 = 3
+
+@[CConst (binding = "DIALOG_BATTERY_BELOW_10", header = "env.h")]
+extern const DIALOG_BATTERY_BELOW_10: nat8
+@[CConst (binding = "DIALOG_BATTERY_BELOW_20", header = "env.h")]
+extern const DIALOG_BATTERY_BELOW_20: nat8
+
+@[CConst (binding = "DIALOG_BLE_DISCONNECTED", header = "env.h")]
+extern const DIALOG_BLE_DISCONNECTED: nat8
+@[CConst (binding = "DIALOG_BLE_CONNECTED", header = "env.h")]
+extern const DIALOG_BLE_CONNECTED: nat8
+@[CConst (binding = "DIALOG_BLE_ENABLED", header = "env.h")]
+extern const DIALOG_BLE_ENABLED: nat8
+
+@[CConst (binding = "DIALOG_USB_DISCONNECTED", header = "env.h")]
+extern const DIALOG_USB_DISCONNECTED: nat8
+@[CConst (binding = "DIALOG_USB_CONNECTED", header = "env.h")]
+extern const DIALOG_USB_CONNECTED: nat8
+
+@[CConst (binding = "SETTINGS_HELP", header = "env.h")]
+extern const SETTINGS_HELP: nat8
+@[CConst (binding = "SETTINGS_UNIT", header = "env.h")]
+extern const SETTINGS_UNIT: nat8
+@[CConst (binding = "SETTINGS_OFFSET", header = "env.h")]
+extern const SETTINGS_OFFSET: nat8
+@[CConst (binding = "SETTINGS_BLE", header = "env.h")]
+extern const SETTINGS_BLE: nat8
+@[CConst (binding = "SETTINGS_BRIGHTNESS", header = "env.h")]
+extern const SETTINGS_BRIGHTNESS: nat8
+const NUM_SETTINGS = 5: nat8
+
+@[CConst (binding = "MEASURE_UNIT_MM", header = "env.h")]
+extern const MEASURE_UNIT_MM: nat8
+@[CConst (binding = "MEASURE_UNIT_CM", header = "env.h")]
+extern const MEASURE_UNIT_CM: nat8
+@[CConst (binding = "MEASURE_UNIT_M", header = "env.h")]
+extern const MEASURE_UNIT_M: nat8
+const NUM_MEASURE_UNITS: nat8 = 3
+
+const MEASURE_FROM_BACK_OFFSET_MM :nat16 = 62
+
+@[CConst (binding = "ORIENTATION_HAT_LEFT", header = "env.h")]
+extern const ORIENTATION_HAT_LEFT: nat8
+@[CConst (binding = "ORIENTATION_HAT_RIGHT", header = "env.h")]
+extern const ORIENTATION_HAT_RIGHT: nat8
+
+const BRIGHTNESS_MAX: nat8 = 12
+const BRIGHTNESS_MIN: nat8 = 7
+
+// Common
+
+/// Delays the current tail for the given ticks. A tick is assumed to be 1/10s.
+activity Delay (ticks: nat16)
+    // assume ticks > 0
+    var i = ticks
+    repeat
+        await true
+        i = i - 1
+    until i == 0 end
+end
+
+/// Delays for given ticks (1/10s per tick) or until woken from sleep.
+activity DelayOrDidWakeup (ticks: nat16)
+    @[CInput (binding = "didWakeup", header = "env.h")]
+    extern let didWakeup: bool
+    when didWakeup abort
+        run Delay(ticks)
+    end
+end
+
+function maxNat8(x: [2]nat8) returns nat8
+    if x[0] >= x[1] then
+        return x[0]
+    else
+        return x[1]
+    end
+end
+
+function chargeChanged(lhs: BatteryInfo, rhs: BatteryInfo) returns bool
+    return lhs.stateOfCharge != rhs.stateOfCharge or lhs.isCharging != rhs.isCharging
+end
+
+// Settings
+
+@[CFunction (source = "env.c")]
+extern function loadSettings () returns Settings
+
+@[CFunction (source = "env.c")]
+extern function storeSettings (settings: Settings)
+
+function equalSettings (a: Settings, b: Settings) returns bool
+    return a.measureFromBack == b.measureFromBack 
+        and a.brightness == b.brightness
+        and a.bleEnabled == b.bleEnabled
+        and a.measureUnit == b.measureUnit
+end
+
+/// Observes settings and writes them to "disk" when changed.
+activity SettingsPersister (settings: Settings) 
+    var prevSettings = settings    
+    repeat
+        await not equalSettings(settings, prevSettings)
+        storeSettings(settings)
+        prevSettings = settings
+    end
+end
+
+// UI Helpers
+
+function anyButtonPressed (buttonStates: ButtonStates) returns bool
+    return buttonStates.aPressed or buttonStates.bPressed
+end
+
+/// Recognizes single, double and long presses of the main button.
+/// Pressing the secondary button is like double-pressing the main button.
+activity PressRecognizer (buttonStates: ButtonStates) returns nat8
+    await anyButtonPressed(buttonStates)
+    if buttonStates.bPressed then
+        return PRESS_DOUBLE
+    end    
+
+    var wasReleased = false
+    var wasDouble = false
+    cobegin weak
+        run Delay(3)
+    with weak
+        await buttonStates.aReleased
+        wasReleased = true
+        await buttonStates.aPressed
+        wasDouble = true
+    end
+    if wasDouble then
+        return PRESS_DOUBLE
+    else
+        if wasReleased then
+            return PRESS_SHORT
+        else
+            return PRESS_LONG
+        end
+    end
+end
+
+function isShortOrDoublePress (press: nat8) returns bool
+    return press == PRESS_SHORT or press == PRESS_DOUBLE
+end
+
+/// Dims level from its current value down to the minimum at a specific duration per step.
+activity DimDown (stepDur: nat8) (level: nat8)
+    repeat
+        level = level - 1
+        run Delay(stepDur)
+    until level == BRIGHTNESS_MIN end
+end
+
+/// Creates a brightness level by dimming the brightness after some time.
+/// Pressing any button while dimmed will put the level back to the desired max level.
+/// Also returns a filtered button-state stream by dropping the button presses used to 
+/// bring the brightness back to max.
+activity Dimmer (maxLevel: nat8) (filteredButtonStates: ButtonStates, level: nat8)
+    @[CInput (binding = "buttonStates", header = "env.h")]
+    extern let buttonStates: ButtonStates
+
+    repeat
+        // Keep the level at max for 5s or every time a button is pressed (restarting the 5s timer).
+        when anyButtonPressed(buttonStates) reset
+            cobegin
+                run Delay(50)
+            with weak
+                repeat
+                    filteredButtonStates = buttonStates
+                    level = maxLevel
+                    await true
+                end
+            end
+        end
+
+        // Dim down until a button is pressed.
+        if not anyButtonPressed(buttonStates) then
+            filteredButtonStates = {}
+            when anyButtonPressed(buttonStates) abort    
+                run DimDown(4)(level)
+                await false
+            end
+            level = maxLevel
+            await true
+        end
+    end
+end
+
+@[CFunction (source = "env.c")]
+extern function setScreenDimming (level: nat8)
+
+/// Controls the resulting brightness of the LCD from 2 brightness requests by 
+/// using the max brightness of both.
+activity BrightnessController (levels: [2]nat8) (level: nat8)
+    var prevLevel = level
+    repeat
+        level = maxNat8(levels)
+        if level != prevLevel then
+            setScreenDimming(level)
+            prevLevel = level
+        end
+        await true
+    end
+end
+
+@[CFunction (source = "env.c")]
+extern function readRotation () returns float32
+
+@[CFunction (source = "env.c")]
+extern function setOrientation (orientation: nat8)
+
+/// Reads the accelerometer data at 1Hz and determines the orientation to use.
+activity RotationController () (orientation: nat8)
+    if readRotation() >= -0.1 then
+        orientation = ORIENTATION_HAT_LEFT
+    else
+        orientation = ORIENTATION_HAT_RIGHT
+    end
+    setOrientation(orientation)
+
+    var prevOrientation = orientation
+    repeat
+        run DelayOrDidWakeup(10)
+
+        let rot = readRotation()
+
+        // Change orientation only if threshold is surpassed.
+        if prevOrientation == ORIENTATION_HAT_LEFT and rot < -0.2 then
+            orientation = ORIENTATION_HAT_RIGHT
+            setOrientation(orientation)
+            prevOrientation = orientation
+        elseif prevOrientation == ORIENTATION_HAT_RIGHT and rot > 0.2 then
+            orientation = ORIENTATION_HAT_LEFT
+            setOrientation(orientation)
+            prevOrientation = orientation
+        end
+    end
+end
+
+// Dialogs
+
+@[CFunction (source = "env.c")]
+extern function displayDialog (request: DialogRequest)
+
+@[CFunction (source = "env.h")]
+extern function hideDialog ()
+
+function insertRequests (requests: [NUM_DIALOGS]DialogRequest) (nexts: [NUM_DIALOGS]DialogRequest)
+    var kind: nat8 = 0
+    while kind < NUM_DIALOGS repeat
+        let r = requests[kind]
+        if r.kind != NO_DIALOG then
+            let indexForkind = r.kind - 1
+            nexts[indexForkind] = r
+        end
+        kind = kind + 1
+    end
+end
+
+function findNextRequest (nexts: [NUM_DIALOGS]DialogRequest) returns int8
+    var i: nat8 = 0
+    repeat
+        if nexts[i].kind != NO_DIALOG then
+            return i as! int8
+        end
+        i = i + 1
+    until i == NUM_DIALOGS end
+    return -1
+end
+
+/// Manages dialog requests by presenting them one after another.
+activity DialogManager (requests: [NUM_DIALOGS]DialogRequest, maxLevel: nat8) (level: nat8)
+
+    // Stores the requests to be shown eventually. Every dialog `kind` has his own slot and only
+    // one request per kind is stored (overwriting a previous but not yet shown request for that slot).
+    var nexts: [NUM_DIALOGS]DialogRequest
+    var delIdx: int8 = -1
+
+    // Handle incoming requests concurrently with displaying them.
+    cobegin
+        repeat
+            // Delete the slot for the previously shown dialog - if any.
+            if prev delIdx != -1 then
+                nexts[prev delIdx] = {}
+            end
+
+            // Sort in new requests according to their priority (encoded in `kind` field),
+            insertRequests(requests)(nexts)
+            await true
+        end    
+    with
+        level = BRIGHTNESS_MIN
+        repeat
+            // Find or wait for a request with highest priority.
+            var idx = findNextRequest(nexts)
+            while idx == -1 repeat
+                await true
+                idx = findNextRequest(nexts)
+            end
+
+            // Immediatly show new dialog if a request of same kind but different content (`info`) is
+            // stored in the current slot.
+            var curr: DialogRequest
+            when nexts[idx].kind != NO_DIALOG and nexts[idx].info != curr.info reset
+                curr = nexts[idx]
+                delIdx = idx
+
+                // Display dialog for current request concurrently with unmarking the displayed slot.
+                cobegin
+                    displayDialog(curr)
+
+                    // Present Dialog for 1s and then dimm down rapidly.
+                    level = maxLevel
+                    run Delay(10)
+                    level = maxLevel
+                    run DimDown(2)(level)
+
+                    hideDialog() 
+                with
+                    await true
+                    delIdx = -1
+                end
+            end
+        end
+    end
+end
+
+/// Observes the battery state of charge and issues a dialog request
+/// when the charge drops below 20% and 10%.
+activity BatteryDialog (battery: BatteryInfo) (request: DialogRequest)
+    var seenBelow20: bool
+    var seenBelow10: bool 
+
+    repeat
+        request = {}
+        if battery.stateOfCharge <= 20 then
+            if not seenBelow20 then
+                request = { kind = DIALOG_BATTERY, info = DIALOG_BATTERY_BELOW_20 }
+                seenBelow20 = true
+            end
+        end
+        if battery.stateOfCharge <= 10 then
+            if not seenBelow10 then
+                request = { kind = DIALOG_BATTERY, info = DIALOG_BATTERY_BELOW_10 }
+                seenBelow10 = true
+            end
+        end
+        if battery.stateOfCharge > 13 then
+            seenBelow10 = false
+        end
+        if battery.stateOfCharge > 23 then
+            seenBelow20 = false
+        end
+        await true
+    end
+end
+
+/// Observes if BLE gets enabled or connected and requests a dialog if so.
+activity BLEDialog (bleEnabled: bool) (request: DialogRequest)
+    var prevBLEEnabled = bleEnabled
+    var enabledRequest: DialogRequest
+    @[CInput (binding = "bleConnected", header = "env.h")]
+    extern let bleConnected: bool
+    var prevBLEConnected = bleConnected
+    var connectedRequest: DialogRequest
+
+    // Detect BLE enabled and connected conditons concurrently and combine them to one dialog request.
+    cobegin
+        repeat
+            connectedRequest = {}
+
+            // Detect if BLE gets connected or disconnected.
+            if bleConnected == prevBLEConnected then
+                await bleConnected != prevBLEConnected
+            end
+            prevBLEConnected = bleConnected
+
+            if bleConnected then
+                connectedRequest = { kind = DIALOG_BLE, info = DIALOG_BLE_CONNECTED }
+            else
+                connectedRequest = { kind = DIALOG_BLE, info = DIALOG_BLE_DISCONNECTED }
+            end
+            await true
+        end
+    with
+        repeat 
+            enabledRequest = {}
+
+            // Detect if BLE gets enabled.
+            await bleEnabled and not prevBLEEnabled
+            prevBLEEnabled = true
+
+            enabledRequest = { kind = DIALOG_BLE, info = DIALOG_BLE_ENABLED }
+            await true
+        end
+    with 
+        repeat
+            // Prioritize requests - enabled has prio naturally.
+            if enabledRequest.kind != 0 then
+                request = enabledRequest
+            elseif connectedRequest.kind != 0 then
+                request = connectedRequest
+            else 
+                request = {}
+            end
+            await true
+        end
+    end
+end
+
+/// This activity will request a dialog if it detects USB being plugged or unplugged.
+activity USBDialog (battery: BatteryInfo) (request: DialogRequest)
+    var prevIsCharging = battery.isCharging
+
+    repeat
+        request = {}
+
+        // Detect if usb is connected by observing isCharging state.
+        if battery.isCharging == prevIsCharging then
+            await battery.isCharging != prevIsCharging
+        end
+        prevIsCharging = battery.isCharging
+
+        if battery.isCharging then
+            request = { kind = DIALOG_USB, info = DIALOG_USB_CONNECTED }
+        else
+            request = { kind = DIALOG_USB, info = DIALOG_USB_DISCONNECTED }
+        end
+        await true
+    end
+end
+
+// Screens
+
+@[CFunction (source = "env.c")]
+extern function displayWelcomeScreen ()
+
+/// The splash screen displayed after setup.
+activity WelcomeScreen ()
+    displayWelcomeScreen()
+    run Delay(20)
+end
+
+@[CFunction (source = "env.c")]
+extern function displayHelpSettingsScreen (page: nat8) returns bool
+
+/// A screen consisting of several text pages explaining the software.
+activity HelpSettingsScreen (buttonStates: ButtonStates) ()
+    var page = 0: nat8
+    repeat
+        let hasNextPage = displayHelpSettingsScreen(page)
+
+        run let press = PressRecognizer(buttonStates)
+        if press == PRESS_SHORT then
+            if hasNextPage then
+                page = page + 1
+            else
+                page = 0
+            end
+        elseif press == PRESS_DOUBLE then
+            // Double pressing allows to jump to the first page.
+            page = 0
+        end
+    until press == PRESS_LONG end
+end
+
+@[CFunction (source = "env.c")]
+extern function displayUnitSettingsScreen (displayedUnit: nat8, selectedUnit: nat8)
+
+/// Screen allowing user to chose the measure unit.
+activity UnitSettingsScreen (buttonStates: ButtonStates) (selectedUnit: nat8)
+    var displayedUnit = selectedUnit
+    repeat
+        displayUnitSettingsScreen(displayedUnit, selectedUnit)
+
+        run let press = PressRecognizer(buttonStates)
+        if press == PRESS_SHORT then
+            displayedUnit = (displayedUnit + 1) % NUM_MEASURE_UNITS
+        elseif press == PRESS_DOUBLE then
+            selectedUnit = displayedUnit
+        end
+    until press == PRESS_LONG end
+end
+
+@[CFunction (source = "env.c")]
+extern function displayOffsetSettingsScreen (measureFromBack: bool)
+
+/// Screen allowing user to toggle between measurment from hat or bottom of stick.
+activity OffsetSettingsScreen (buttonStates: ButtonStates) (measureFromBack: bool)
+    repeat
+        displayOffsetSettingsScreen(measureFromBack)
+
+        run let press = PressRecognizer(buttonStates)
+        if isShortOrDoublePress(press) then
+            measureFromBack = not measureFromBack
+        end
+    until press == PRESS_LONG end
+end
+
+@[CFunction (source = "env.c")]
+extern function displayBLESettingsScreen (bleEnabled: bool)
+
+@[CFunction (source = "env.c")]
+extern function enableBLE ()
+
+@[CFunction (source = "env.c")]
+extern function requestRestart ()
+
+/// Screen to enable or disable bluetooth.
+activity BLESettingsScreen (buttonStates: ButtonStates) (bleEnabled: bool)
+    repeat
+        displayBLESettingsScreen(bleEnabled)
+
+        run let press = PressRecognizer(buttonStates)        
+        if press == PRESS_DOUBLE then
+            if bleEnabled then
+                bleEnabled = false
+
+                // To cleanly disable BLE we have to restart the system.
+                requestRestart()
+                await false
+            else
+                bleEnabled = true
+
+                // Allow the BLE-enabled dialog to show up before the blocking enableBLE() call.
+                await true
+                enableBLE()
+            end
+        end
+    until press == PRESS_LONG end
+end
+
+@[CFunction (source = "env.c")]
+extern function displayBrightnessSettingsScreen (brightness: nat8)
+
+/// This screen allows the user to select the brightness of the LCD.
+activity BrightnessSettingsScreen (buttonStates: ButtonStates) (brightness: nat8)
+    repeat
+        displayBrightnessSettingsScreen(brightness - BRIGHTNESS_MIN)
+
+        run let press = PressRecognizer(buttonStates)  
+        if isShortOrDoublePress(press) then
+            brightness = brightness - 1
+            if brightness < 8 then
+                brightness = 12
+            end
+        end
+    until press == PRESS_LONG end
+end
+
+@[CFunction (source = "env.c")]
+extern function displaySettingsScreen (index: nat8)
+
+/// A screen showing the possible setting sub-screens.
+activity SettingsScreen (buttonStates: ButtonStates) (settings: Settings)
+    var index = 0: nat8
+    repeat
+        displaySettingsScreen(index)
+
+        run let press = PressRecognizer(buttonStates)
+        if press == PRESS_SHORT then
+            index = (index + 1) % NUM_SETTINGS
+        elseif press == PRESS_DOUBLE then
+
+            // Run the selected settings sub-screen and persist changes to settings
+            // made there concurrently here for any screen.
+            cobegin
+                if index == SETTINGS_HELP then
+                    run HelpSettingsScreen(buttonStates)
+                elseif index == SETTINGS_UNIT then
+                    run UnitSettingsScreen(buttonStates)(settings.measureUnit)
+                elseif index == SETTINGS_OFFSET then
+                    run OffsetSettingsScreen(buttonStates)(settings.measureFromBack)
+                elseif index == SETTINGS_BLE then
+                    run BLESettingsScreen(buttonStates)(settings.bleEnabled)
+                elseif index == SETTINGS_BRIGHTNESS then
+                    run BrightnessSettingsScreen(buttonStates)(settings.brightness)
+                end
+            with weak
+                run SettingsPersister(settings)
+            end
+        end
+    until press == PRESS_LONG end
+end
+
+@[CFunction (source = "env.c")]
+extern function displayHomeScreen (battery: BatteryInfo, bleEnabled: bool)
+
+/// Displays the home-screen and on button press the setting sub-screens.
+/// While showing the home-screen or sub-screens the LCD will dim down after some time
+/// to preserve battery.
+activity HomeScreen (battery: BatteryInfo) (level: nat8, settings: Settings)
+    @[CInput (binding = "bleConnected", header = "env.h")]
+    extern let bleConnected: bool
+    var prevBLEConnected = bleConnected
+    var prevBattery = battery
+    var buttonStates: ButtonStates
+    var brightness = settings.brightness
+
+    cobegin
+        repeat        
+            // Display home until button pressed.
+            var pressType: nat8
+            cobegin weak
+                repeat
+                    displayHomeScreen(battery, settings.bleEnabled)
+
+                    // Only redraw if content changes.
+                    await bleConnected != prevBLEConnected or chargeChanged(battery, prevBattery)
+                    prevBLEConnected = bleConnected
+                    prevBattery = battery
+                end
+            with
+                run pressType = PressRecognizer(buttonStates)
+            end
+
+            // Enter sub-screens on double-press.
+            if pressType == PRESS_DOUBLE then
+                run SettingsScreen(buttonStates)(settings)
+            end
+        until pressType == PRESS_SHORT end        
+    with weak
+        run Dimmer(prev brightness)(buttonStates, level)
+    with weak
+        repeat
+            brightness = settings.brightness
+            await true
+        end
+    end
+end 
+
+@[CFunction (source = "env.c")]
+extern function displayRangingScreen (range: nat16, battery: BatteryInfo, orientation: nat8, settings: Settings)
+
+/// The screen to show while doing measurement.
+activity RangingScreen (range: nat16, battery: BatteryInfo, orientation: nat8, settings: Settings)
+    @[CInput (binding = "buttonStates", header = "env.h")]
+    extern let buttonStates: ButtonStates
+
+    // Update screen on every step until button pressed.
+    cobegin weak
+        repeat
+            displayRangingScreen(range, battery, orientation, settings)
+            await true
+        end    
+    with
+        await buttonStates.aPressed
+    end
+end
+
+@[CFunction (source = "env.c")]
+extern function displayErrorScreen (err: nat8)
+
+/// Displays any setup error and allows to restart via button press.
+activity ErrorScreen (err: nat8)
+    displayErrorScreen(err)
+
+    @[CInput (binding = "buttonStates", header = "env.h")]
+    extern let buttonStates: ButtonStates
+    run _ = PressRecognizer(buttonStates) 
+    requestRestart()
+    await false
+end
+  
+/// Manages the user input via buttons and the output via the LCD.
+activity UI (setupErr: nat8, range: nat16, battery: BatteryInfo) (rangingRequest: bool, brightness: nat8, settings: Settings)
+    var screenBrightness: nat8 = settings.brightness
+    var dialogBrightness: nat8 = settings.brightness
+    var bleDialogRequest: DialogRequest
+    var usbDialogRequest: DialogRequest
+    var batteryDialogRequest: DialogRequest
+    var orientation: nat8
+
+    // While displaying screens, concurrently display dialogs if needed, and 
+    // control brightness and rotation.
+    cobegin
+        run WelcomeScreen()
+
+        if setupErr != ERR_OK then
+            run ErrorScreen(setupErr)
+        else
+            // Alternate between the home screen and the ranging screen.
+            repeat
+                run HomeScreen(battery)(screenBrightness, settings)
+                rangingRequest = true
+
+                run RangingScreen(range, battery, orientation, settings)
+                rangingRequest = false
+            end
+        end        
+    with
+        run BLEDialog(settings.bleEnabled)(bleDialogRequest)
+    with
+        run USBDialog(battery)(usbDialogRequest)
+    with
+        run BatteryDialog(battery)(batteryDialogRequest)
+    with
+        run DialogManager({bleDialogRequest, usbDialogRequest, batteryDialogRequest}, settings.brightness)(dialogBrightness)
+    with
+        run BrightnessController({screenBrightness, dialogBrightness})(brightness)
+    with
+        run RotationController()(orientation)
+    end
+end
+
+// Ranging
+
+@[CFunction (source = "env.c")]
+extern function startRanging ()
+
+@[CFunction (source = "env.c")]
+extern function measure () returns nat16
+
+@[CFunction (source = "env.c")]
+extern function stopRanging ()
+
+/// Measures the range either from top or back of the stick if requested.
+activity RangeSensor (rangingRequested: bool, measureFromBack: bool) (range: nat16)
+    repeat
+        // Wait for ranging request.
+        if not rangingRequested then
+            await rangingRequested
+        end
+
+        // Measure on every timestep until ranging is not requested anymore.
+        startRanging()
+        repeat
+            range = measure()
+
+            // If we measure from the back of the stick we have to add that offset.
+            if measureFromBack then
+                range = range + MEASURE_FROM_BACK_OFFSET_MM
+            end
+            await true
+        until not rangingRequested end
+        stopRanging()
+    end
+end
+
+// Bluetooth
+
+@[CFunction (source = "env.c")]
+extern function publishRange (range: nat16)
+
+@[CFunction (source = "env.c")]
+extern function publishBattery (battery: BatteryInfo)
+
+/// Publishes range and battery values via Bluetooth LE if connected.
+activity BluetoothPublisher (range: nat16, battery: BatteryInfo)
+    @[CInput (binding = "bleConnected", header = "env.h")]
+    extern let bleConnected: bool
+    
+    repeat
+        // Wait for a BLE connection.
+        if not bleConnected then
+            await bleConnected
+        end
+
+        // Publish range and battery if they changed until BLE gets disconnected.
+        var prevRange = UNDEF_RANGE
+        var prevBattery: BatteryInfo
+        repeat
+            if range != prevRange then
+                publishRange(range)
+                prevRange = range
+            end
+            if chargeChanged(battery, prevBattery) then
+                publishBattery(battery)
+                prevBattery = battery
+            end
+            await true
+        until not bleConnected end
+    end
+end
+
+// Battery & Sleep
+
+@[CFunction (source = "env.c")]
+extern function readBatteryInfo () returns BatteryInfo
+
+/// Senses the battery every second.
+activity BatterySensor () (batteryInfo: BatteryInfo)
+    repeat
+        batteryInfo = readBatteryInfo()
+
+        // Read the battery every second or when we just woke up.
+        run DelayOrDidWakeup(10)
+    end
+end
+
+@[CFunction (source = "env.c")]
+extern function activateDisplay (active: bool)
+
+@[CFunction (source = "env.c")]
+extern function enterSleep (ticks: nat16)
+
+/// Tries to preserve battery by enterying sleep mode if possible.
+activity PowerManager (battery: BatteryInfo, level: nat8, bleEnabled: bool)
+    repeat
+        // Wait until the screen is dimmed down.
+        await level == BRIGHTNESS_MIN
+
+        // Leave sleep if dimmed up.
+        when level != BRIGHTNESS_MIN abort
+
+            // Wait a second until we shut off power to the LCD.
+            run Delay(10)
+            activateDisplay(false)
+
+            // We put the CPU to sleep only if we don't have a BLE connection.
+            @[CInput (binding = "bleConnected", header = "env.h")]
+            extern let bleConnected: bool
+            if bleConnected then
+                await false
+            else 
+                @[CInput (binding = "didWakeup", header = "env.h")]
+                extern let didWakeup: bool
+                when didWakeup reset
+
+                    // If we woke up, run for 1s.
+                    run Delay(10)
+
+                    // Put CPU to sleep for 10s or 60s depending on BLE enabled.
+                    if bleEnabled then
+                        enterSleep(100)
+                    else
+                        enterSleep(600)
+                    end
+                    await false
+                end
+            end
+        end
+
+        // Renable LCD.
+        activateDisplay(true)
+    end
+end
+
+// Main
+
+/// The top-level of the system composed of connected subsystems.
+@[EntryPoint]
+activity Main (setupErr: nat8)
+    var range: nat16
+    var battery: BatteryInfo
+    var rangingRequest = false
+    @[CInput (binding = "bleConnected", header = "env.h")]
+    extern let bleConnected: bool
+    var brightness: nat8
+    var settings = loadSettings()
+
+    // Setup the subsystems and the connections between them.
+    cobegin
+        run RangeSensor(prev rangingRequest or bleConnected, prev settings.measureFromBack)(range)
+    with
+        run BatterySensor()(battery)
+    with
+        run UI(setupErr, range, battery)(rangingRequest, brightness, settings)
+    with
+        run BluetoothPublisher(range, battery)
+    with
+        run PowerManager(battery, brightness, settings.bleEnabled)
+    end                
+end
