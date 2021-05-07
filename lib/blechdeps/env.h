@@ -1,4 +1,4 @@
-// Ranger
+// ranger
 // Copyright (c) 2021, Framework Labs.
 
 #include "blech.h"
