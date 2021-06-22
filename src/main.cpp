@@ -250,7 +250,8 @@ blc_bool blc_ranger_displayHelpSettingsScreen(const blc_nat8 page)
 
   var hasNextPage = true;
   int16_t y = 24;
-  let pr = [&y](const char *txt) {
+  let pr = [&y](const char *txt)
+  {
     screen.setCursor(6, y);
     screen.print(txt);
     y += 14;
@@ -586,14 +587,15 @@ static bool setupBT()
   };
   server->setCallbacks(new Callbacks);
 
-  var *descriptor = new BLE2902;
-  descriptor->setNotifications(true);
-
   var *rangeService = server->createService(RANGE_SERVICE_UUID);
   rangeChar = rangeService->createCharacteristic(
       RANGE_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  rangeChar->addDescriptor(descriptor);
+  {
+    var *descriptor = new BLE2902;
+    descriptor->setNotifications(true);
+    rangeChar->addDescriptor(descriptor);
+  }
   rangeService->start();
 
   uint16_t rangeValue = UNDEF_RANGE;
@@ -601,7 +603,11 @@ static bool setupBT()
 
   var *batteryService = server->createService(BATTERY_SERVICE_UUID);
   batteryChar = batteryService->createCharacteristic(BATTERY_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  batteryChar->addDescriptor(descriptor);
+  {
+    var *descriptor = new BLE2902;
+    descriptor->setNotifications(true);
+    batteryChar->addDescriptor(descriptor);
+  }
   batteryService->start();
 
   uint8_t batteryValue = 0;
