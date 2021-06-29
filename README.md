@@ -59,4 +59,8 @@ Unfortunately, the M5StickC is not very power efficient and only has a small bat
 When Bluetooth is enabled, a single BLE central can connect to the stick and measurement will start independent from the currently visible screen. When the connection is stopped, the measurement will also stop unless you are on the ranging screen.
 Besides the measured distance, the current state of charge is also published via BLE.
 
+## Misc
+
+If you are on a Mac, the [RangeExtender](https://github.com/frameworklabs/RangeExtender) project provides a simple Swift API to access the range and battery values notified by the ranger device.
+
 Happy range-finding!
