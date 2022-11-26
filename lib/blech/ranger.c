@@ -20,7 +20,7 @@
 ** exports, user types and C wrappers
 */
 
-#include "blech/ranger.h"
+#include "ranger.h"
 
 /*
 ** direct C constants
